@@ -1,100 +1,67 @@
-import { App, WorkflowStep } from "@slack/bolt";
+import { App, WorkflowStep, ExpressReceiver } from "@slack/bolt";
 
 const port = process.env.PORT || 3000;
 
-const app = new App({
-  token: process.env.SLACK_BOT_TOKEN,
+// ✅ ExpressReceiver を使う（HTTP受信 & health check をちゃんと付ける）
+const receiver = new ExpressReceiver({
   signingSecret: process.env.SLACK_SIGNING_SECRET,
-
-  // Render + Slack用
-  processBeforeResponse: false
+  // Slackからのリクエストを先にACK返しやすくする
+  processBeforeResponse: false,
 });
 
-/*
-Workflow Step
-Callback ID と一致させる
-*/
-const step = new WorkflowStep("hrmos_stamp_step", {
+// ✅ ここが “本体”
+const app = new App({
+  token: process.env.SLACK_BOT_TOKEN,
+  receiver,
+  processBeforeResponse: false,
+});
 
-  /*
-  WF編集時
-  */
+// ✅ health check（Renderの疎通確認に便利）
+receiver.app.get("/", (req, res) => {
+  res.status(200).send("ok");
+});
+
+// ---- Workflow Step ----
+// Slack App側で作った Callback ID と一致させる
+const step = new WorkflowStep("hrmos_stamp_step", {
   edit: async ({ ack, configure }) => {
     await ack();
-
     await configure({
       blocks: [
         {
           type: "section",
-          text: {
-            type: "mrkdwn",
-            text: "HRMOS打刻ステップ（テスト）"
-          }
-        }
-      ]
+          text: { type: "mrkdwn", text: "HRMOS打刻ステップ（テスト）🐣" },
+        },
+      ],
     });
   },
 
-  /*
-  保存時
-  */
   save: async ({ ack }) => {
-    await ack({
-      outputs: []
-    });
+    await ack({ outputs: [] });
   },
 
-  /*
-  WF実行時
-  */
   execute: async ({ step, complete, fail }) => {
     try {
-
-      console.log("WF STEP EXECUTE");
-
-      console.log({
+      // ✅ まずは軽くログだけ（3秒制限対策）
+      console.log("[WF EXECUTE]", {
         step_id: step?.id,
+        workflow_id: step?.workflow_id,
         actor_user_id: step?.actor_user_id,
-        workflow_id: step?.workflow_id
       });
 
-      /*
-      いまはとにかく成功させる
-      */
+      // ✅ いったん必ず成功（次のステップで users.info や GAS を入れる）
       await complete({});
-
     } catch (err) {
-
-      console.error("WF STEP ERROR", err);
-
-      await fail({
-        error: {
-          message: err.message
-        }
-      });
-
+      console.error("[WF ERROR]", err);
+      await fail({ error: { message: String(err?.message || err) } });
     }
-  }
+  },
 });
 
 app.step(step);
 
-
-/*
-ヘルスチェック
-*/
-app.get("/", async (req, res) => {
-  res.send("Slack Bolt HRMOS app running");
-});
-
-
-/*
-サーバ起動
-*/
+// 起動
 (async () => {
-
   await app.start(port);
-
-  console.log("⚡ Bolt app running on port", port);
-
+  console.log(`⚡️ Bolt app running on port ${port}`);
 })();
