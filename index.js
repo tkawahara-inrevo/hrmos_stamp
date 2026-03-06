@@ -1,10 +1,10 @@
 import pkg from "@slack/bolt";
+import crypto from "node:crypto";
 
 const { App, ExpressReceiver } = pkg;
 
 const port = process.env.PORT || 3000;
 
-// Render/Slack用（署名検証 + 早期レスポンス）
 const receiver = new ExpressReceiver({
   signingSecret: process.env.SLACK_SIGNING_SECRET,
   processBeforeResponse: false,
@@ -16,154 +16,169 @@ const app = new App({
   processBeforeResponse: false,
 });
 
-// ---- health check ----
-receiver.app.get("/", (_req, res) => res.status(200).send("ok"));
+// Render health check
+receiver.app.get("/", (_req, res) => {
+  res.status(200).send("ok");
+});
 
-// ---- util: safe fetch with timeout ----
-async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
-  const controller = new AbortController();
-  const id = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, { ...options, signal: controller.signal });
-    return res;
-  } finally {
-    clearTimeout(id);
+function safeString(v) {
+  return v == null ? "" : String(v);
+}
+
+function normalizeWorkflowType(workflowId, inputs) {
+  const explicit =
+    safeString(inputs?.workflow_type || inputs?.type || inputs?.stamp_type).toLowerCase();
+
+  if (explicit.includes("out")) return "clock_out";
+  if (explicit.includes("in")) return "clock_in";
+
+  const wfClockInId = safeString(process.env.WF_CLOCK_IN_ID);
+  const wfClockOutId = safeString(process.env.WF_CLOCK_OUT_ID);
+
+  if (workflowId && wfClockOutId && workflowId === wfClockOutId) return "clock_out";
+  if (workflowId && wfClockInId && workflowId === wfClockInId) return "clock_in";
+
+  return "clock_in";
+}
+
+function extractActorUserId(body, inputs) {
+  return (
+    safeString(body?.event?.user_id) ||
+    safeString(body?.event?.actor_user_id) ||
+    safeString(body?.interactivity?.interactor?.id) ||
+    safeString(body?.user_id) ||
+    safeString(inputs?.reporter_user_id) ||
+    safeString(inputs?.user_id) ||
+    safeString(inputs?.user)
+  );
+}
+
+function extractChannelId(body, inputs) {
+  return (
+    safeString(body?.event?.channel_id) ||
+    safeString(body?.channel?.id) ||
+    safeString(body?.container?.channel_id) ||
+    safeString(inputs?.channel_id) ||
+    safeString(inputs?.channel)
+  );
+}
+
+function normalizeStampFlag(inputs) {
+  const raw =
+    safeString(inputs?.hrmos_stamp) ||
+    safeString(inputs?.stamp) ||
+    safeString(inputs?.do_stamp);
+
+  return raw.trim();
+}
+
+async function postToGas(payload) {
+  const gasUrl = safeString(process.env.GAS_WEBAPP_URL);
+  if (!gasUrl) {
+    throw new Error("Missing env: GAS_WEBAPP_URL");
   }
+
+  const res = await fetch(gasUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const text = await res.text();
+
+  return {
+    status: res.status,
+    okHttp: res.ok,
+    bodyText: text,
+  };
 }
 
-// ---- util: Slack user id -> email ----
-async function getSlackEmail(client, userId) {
-  const info = await client.users.info({ user: userId });
-  const email = info?.user?.profile?.email || "";
-  return String(email || "").toLowerCase();
-}
-
-// ---- util: decide IN/OUT ----
-// 方式A: workflow_idで判定（おすすめ）
-//  - RenderのENVに WF_CLOCK_IN_ID / WF_CLOCK_OUT_ID を入れる
-// 方式B: inputs.type があればそれを優先
-function decideStampType({ workflowId, inputs }) {
-  const t = String(inputs?.type || inputs?.stamp_type || "").toLowerCase();
-  if (t === "out" || t === "clock_out") return "OUT";
-  if (t === "in" || t === "clock_in") return "IN";
-
-  const wfIn = process.env.WF_CLOCK_IN_ID || "";
-  const wfOut = process.env.WF_CLOCK_OUT_ID || "";
-  if (workflowId && wfOut && workflowId === wfOut) return "OUT";
-  if (workflowId && wfIn && workflowId === wfIn) return "IN";
-
-  // どっちでもない時はINに倒す（ログで気づけるようにする）
-  return "IN";
-}
-
-// ---- util: should stamp? ----
-// inputs.stamp が "する" のときだけ true
-function shouldStamp(inputs) {
-  const flag = String(inputs?.stamp || inputs?.hrmos_stamp || "").trim();
-  if (!flag) return true; // 入力が無い運用なら「する」前提にしておく（必要ならfalseに変えてね）
-  return flag === "する" || flag.toLowerCase() === "true";
-}
-
-// =====================================================
-// ✅ Custom Step listener（これが本体）
-// Callback ID は Slack App側で作ったものと一致させる
-// =====================================================
-app.function("hrmos_stamp_step", async ({ client, inputs, complete, fail, body, logger }) => {
-  // ここで重いことをすると3秒で死ぬので、まずログだけ＆即complete
+// Slack Custom Step callback_id と一致させる
+app.function("hrmos_stamp_step", async ({ body, inputs, complete, fail, logger }) => {
   try {
     const workflowId =
-      body?.event?.workflow?.id ||
-      body?.workflow?.id ||
-      body?.event?.workflow_id ||
-      "";
+      safeString(body?.event?.workflow?.id) ||
+      safeString(body?.workflow?.id) ||
+      safeString(body?.event?.workflow_id);
 
-    const actorUserId =
-      body?.event?.user_id ||
-      body?.event?.actor_user_id ||
-      body?.user_id ||
-      "";
+    const workflowExecutionId =
+      safeString(body?.event?.workflow_execution_id) ||
+      safeString(body?.workflow_execution_id);
 
-    logger.info("[FUNCTION_IN]", {
+    const actorUserId = extractActorUserId(body, inputs);
+    const channelId = extractChannelId(body, inputs);
+    const workflowType = normalizeWorkflowType(workflowId, inputs);
+    const hrmosStamp = normalizeStampFlag(inputs);
+
+    logger.info("[FUNCTION_RECEIVED]", {
       workflowId,
+      workflowExecutionId,
       actorUserId,
-      inputsKeys: Object.keys(inputs || {}),
+      channelId,
+      workflowType,
+      hrmosStamp,
+      inputKeys: Object.keys(inputs || {}),
     });
 
-    // ✅ Slackへの応答を先に返す（失敗メッセージを避ける）
+    // まずSlackには即成功を返す
     await complete({ outputs: {} });
 
-    // ✅ 以降はバックグラウンドでやる（待たない）
+    // 以降は非同期でGASへ
     setImmediate(async () => {
-      const reqId = crypto.randomUUID();
+      const requestId = crypto.randomUUID();
+
       try {
-        if (!actorUserId) {
-          logger.error("[BG] missing actorUserId", { reqId });
-          return;
-        }
-
-        // 打刻する？（"する" 以外なら何もしない）
-        if (!shouldStamp(inputs)) {
-          logger.info("[BG] stamp skipped by flag", { reqId });
-          return;
-        }
-
-        const email = await getSlackEmail(client, actorUserId);
-        if (!email) {
-          logger.error("[BG] email not found", { reqId, actorUserId });
-          return;
-        }
-
-        const stampType = decideStampType({ workflowId, inputs });
-
-        const gasUrl = process.env.GAS_WEBAPP_URL || "";
-        if (!gasUrl) {
-          logger.error("[BG] missing GAS_WEBAPP_URL", { reqId });
-          return;
-        }
-
-        const secret = process.env.GAS_SHARED_SECRET || "";
-
         const payload = {
-          workflow_type: stampType === "OUT" ? "clock_out" : "clock_in",
-          user: actorUserId,
-          email,
-          stamp_type: stampType, // "IN"/"OUT"
-          secret,
+          workflow_type: workflowType,
+          channel_id: channelId,
+          reporter_user_id: actorUserId,
+          hrmos_stamp: hrmosStamp,
+          secret: safeString(process.env.GAS_SHARED_SECRET),
           meta: {
+            request_id: requestId,
             workflow_id: workflowId,
-            request_id: reqId,
+            workflow_execution_id: workflowExecutionId,
           },
         };
 
-        const res = await fetchWithTimeout(
-          gasUrl,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload),
+        logger.info("[GAS_POST_REQUEST]", {
+          requestId,
+          payloadPreview: {
+            workflow_type: payload.workflow_type,
+            channel_id: payload.channel_id,
+            reporter_user_id: payload.reporter_user_id,
+            hrmos_stamp: payload.hrmos_stamp,
+            has_secret: !!payload.secret,
           },
-          8000
-        );
-
-        const text = await res.text();
-        logger.info("[BG] GAS_RESULT", {
-          reqId,
-          status: res.status,
-          body_preview: String(text).slice(0, 300),
         });
-      } catch (e) {
-        logger.error("[BG] ERROR", { reqId, error: String(e) });
+
+        const gasRes = await postToGas(payload);
+
+        logger.info("[GAS_POST_RESPONSE]", {
+          requestId,
+          status: gasRes.status,
+          okHttp: gasRes.okHttp,
+          bodyPreview: safeString(gasRes.bodyText).slice(0, 300),
+        });
+      } catch (bgErr) {
+        logger.error("[GAS_POST_ERROR]", {
+          requestId,
+          error: safeString(bgErr?.stack || bgErr),
+        });
       }
     });
-  } catch (e) {
-    logger.error("[FUNCTION_ERROR]", e);
-    // ここでfailするとWF上で失敗になる（必要なら）
-    await fail({ error: `Failed to start function: ${String(e)}` });
+  } catch (err) {
+    logger.error("[FUNCTION_ERROR]", safeString(err?.stack || err));
+
+    await fail({
+      error: `hrmos_stamp_step failed: ${safeString(err?.message || err)}`,
+    });
   }
 });
 
-// 起動
 (async () => {
   await app.start(port);
-  console.log(`⚡ Bolt running on port ${port}`);
+  console.log(`⚡ Bolt app running on port ${port}`);
 })();
